@@ -122,70 +122,236 @@ export function AIAgent({ onLogActivity, activities }: AIAgentProps) {
     e.target.value = ''; // reset
   };
 
+  // Validate input before sending
+  const validateInput = (text: string): { valid: boolean; error?: string } => {
+    if (!text.trim()) {
+      return { valid: false, error: 'Message cannot be empty' };
+    }
+    if (text.length > 5000) {
+      return { valid: false, error: 'Message is too long (max 5000 characters)' };
+    }
+    return { valid: true };
+  };
+
+  // Get user-friendly error message with retry guidance
+  const getErrorMessage = (status?: number, error?: any): { message: string; retryable: boolean } => {
+    if (status === 429) {
+      return {
+        message: '⏳ I\'m getting too many requests. Please wait a moment and try again.',
+        retryable: true,
+      };
+    }
+    if (status === 503) {
+      return {
+        message: '🔧 The AI service is temporarily busy. Please try again in a few moments.',
+        retryable: true,
+      };
+    }
+    if (error?.code === 'RATE_LIMITED') {
+      return {
+        message: '⏳ I\'m getting flooded with requests. Please wait a moment and try again.',
+        retryable: true,
+      };
+    }
+    if (error?.code === 'SERVICE_UNAVAILABLE') {
+      return {
+        message: '🔧 The AI service is temporarily unavailable. Please try again soon.',
+        retryable: true,
+      };
+    }
+    if (error?.code === 'TIMEOUT') {
+      return {
+        message: '⏰ Your request took too long. Please try with a shorter message.',
+        retryable: true,
+      };
+    }
+    if (error?.code === 'TOKEN_LIMIT_EXCEEDED') {
+      return {
+        message: '📚 Our conversation got really long! Please start a new chat to continue.',
+        retryable: false,
+      };
+    }
+    return {
+      message: '🙈 I\'m having trouble connecting. Please check your connection and try again.',
+      retryable: true,
+    };
+  };
+
+  // Retry logic with exponential backoff
+  const fetchWithRetry = async (
+    url: string,
+    options: RequestInit,
+    maxAttempts = 3
+  ): Promise<Response> => {
+    let lastError: any;
+    let delay = 1000;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout
+
+        const response = await fetch(url, {
+          ...options,
+          signal: controller.signal,
+        });
+
+        clearTimeout(timeoutId);
+
+        // Don't retry on client errors (except 429, 503)
+        if (response.status !== 429 && response.status !== 503 && response.status >= 400 && response.status < 500) {
+          return response;
+        }
+
+        if (response.ok) {
+          return response;
+        }
+
+        // Retryable errors
+        if (response.status === 429 || response.status === 503) {
+          if (attempt === maxAttempts - 1) {
+            return response;
+          }
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          delay = Math.min(delay * 2, 16000);
+          continue;
+        }
+
+        return response;
+      } catch (error: any) {
+        lastError = error;
+
+        // Don't retry on abort/timeout on last attempt
+        if (attempt === maxAttempts - 1) {
+          throw error;
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        delay = Math.min(delay * 2, 16000);
+      }
+    }
+
+    throw lastError;
+  };
+
   const handleSubmit = async (e?: React.FormEvent, overrideInput?: string) => {
     if (e) e.preventDefault();
     const finalInput = overrideInput !== undefined ? overrideInput : input;
-    if ((!finalInput.trim() && !selectedFile) || isLoading) return;
+    
+    if (isLoading) return;
 
-    const userMsg: Message = { 
-      id: crypto.randomUUID(), 
-      role: 'user', 
+    // Validate input
+    const validation = validateInput(finalInput);
+    if (!validation.valid && !selectedFile) {
+      return; // Silent fail on empty message
+    }
+
+    const userMsg: Message = {
+      id: crypto.randomUUID(),
+      role: 'user',
       content: finalInput,
-      attachment: selectedFile ? { mimeType: selectedFile.mimeType, data: selectedFile.data } : undefined
+      attachment: selectedFile ? { mimeType: selectedFile.mimeType, data: selectedFile.data } : undefined,
     };
     const newMessages = [...messages, userMsg];
-    
+
     setMessages(newMessages);
     setInput('');
     setSelectedFile(null);
     setIsLoading(true);
 
     try {
-      const response = await fetch('/api/chat', {
+      const response = await fetchWithRetry('/api/chat', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ 
-          messages: newMessages.map(m => ({
-            role: m.role, 
+        body: JSON.stringify({
+          messages: newMessages.map((m) => ({
+            role: m.role,
             content: m.content,
-            attachment: m.attachment
-          })) 
+            attachment: m.attachment,
+          })),
         }),
       });
 
+      let data: any = null;
+
       if (!response.ok) {
-        const errorText = await response.text().catch(() => "");
-        let errorData = null;
-        try { errorData = JSON.parse(errorText); } catch(e) {}
-        throw new Error(errorData?.error || 'Chat API failed');
+        const responseText = await response.text().catch(() => '');
+        try {
+          data = JSON.parse(responseText);
+        } catch {
+          // Couldn't parse error response
+        }
+
+        const { message, retryable } = getErrorMessage(response.status, data?.error);
+        
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: crypto.randomUUID(),
+            role: 'model',
+            content: retryable ? `${message}\n\n[You can try again]` : message,
+          },
+        ]);
+        return;
       }
 
-      const text = await response.text();
-      let data = null;
       try {
+        const text = await response.text();
         data = JSON.parse(text);
       } catch (e) {
-        throw new Error("Received invalid format from chat API");
-      }
-      
-      const newModelMsg: Message = { id: crypto.randomUUID(), role: 'model', content: data.reply };
-      
-      if (data.autoLoggedActivity) {
-         newModelMsg.pendingActivity = data.autoLoggedActivity;
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: crypto.randomUUID(),
+            role: 'model',
+            content: '🙈 I got a garbled response. Please try again!',
+          },
+        ]);
+        return;
       }
 
-      setMessages(prev => [...prev, newModelMsg]);
+      // Validate response has required fields
+      if (!data.success || !data.reply) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: crypto.randomUUID(),
+            role: 'model',
+            content: '🙈 I got an incomplete response. Please try again!',
+          },
+        ]);
+        return;
+      }
+
+      const newModelMsg: Message = {
+        id: crypto.randomUUID(),
+        role: 'model',
+        content: data.reply,
+      };
+
+      if (data.autoLoggedActivity) {
+        newModelMsg.pendingActivity = data.autoLoggedActivity;
+      }
+
+      setMessages((prev) => [...prev, newModelMsg]);
     } catch (error: any) {
-      console.error(error);
-      const errorMsg = error?.message && error.message !== 'Chat API failed' 
-        ? `Oh no! 🙈 ${error.message}` 
-        : "Oh no! 🙈 I'm having trouble connecting right now. Can we try again later?";
-        
-      setMessages(prev => [
+      console.error('[AIAgent] Error in handleSubmit:', error);
+      
+      const isTimeout = error?.name === 'AbortError';
+      const { message } = getErrorMessage(
+        undefined,
+        isTimeout ? { code: 'TIMEOUT' } : undefined
+      );
+
+      setMessages((prev) => [
         ...prev,
-        { id: crypto.randomUUID(), role: 'model', content: errorMsg }
+        {
+          id: crypto.randomUUID(),
+          role: 'model',
+          content: `${message}\n\n[You can try again]`,
+        },
       ]);
     } finally {
       setIsLoading(false);

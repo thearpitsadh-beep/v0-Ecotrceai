@@ -24,196 +24,562 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 // server.ts
 var import_express = __toESM(require("express"), 1);
 var import_path = __toESM(require("path"), 1);
+var import_helmet = __toESM(require("helmet"), 1);
+var import_cors = __toESM(require("cors"), 1);
+var import_express_rate_limit = __toESM(require("express-rate-limit"), 1);
 var import_vite = require("vite");
+
+// src/lib/validation/chatbot.schemas.ts
+var import_zod = require("zod");
+var chatMessageSchema = import_zod.z.object({
+  role: import_zod.z.enum(["user", "assistant"]),
+  content: import_zod.z.string().min(1).max(5e3)
+});
+var chatRequestSchema = import_zod.z.object({
+  messages: import_zod.z.array(chatMessageSchema).min(1).max(50),
+  sessionId: import_zod.z.string().optional()
+});
+var chatResponseSchema = import_zod.z.object({
+  success: import_zod.z.boolean(),
+  data: import_zod.z.object({
+    response: import_zod.z.string(),
+    tokensUsed: import_zod.z.number().int().positive()
+  }).optional(),
+  error: import_zod.z.object({
+    code: import_zod.z.string(),
+    message: import_zod.z.string(),
+    retryable: import_zod.z.boolean()
+  }).optional()
+});
+var activitySchema = import_zod.z.object({
+  type: import_zod.z.string().min(1).max(100),
+  duration: import_zod.z.number().positive(),
+  impact: import_zod.z.number().nonnegative()
+});
+var insightsRequestSchema = import_zod.z.object({
+  activities: import_zod.z.array(activitySchema).min(1).max(10),
+  totalFootprint: import_zod.z.number().nonnegative()
+});
+var insightsResponseSchema = import_zod.z.object({
+  success: import_zod.z.boolean(),
+  data: import_zod.z.object({
+    insights: import_zod.z.array(import_zod.z.string()).min(1),
+    recommendation: import_zod.z.string()
+  }).optional(),
+  error: import_zod.z.object({
+    code: import_zod.z.string(),
+    message: import_zod.z.string(),
+    retryable: import_zod.z.boolean()
+  }).optional()
+});
+function sanitizeMessage(content) {
+  return content.trim().substring(0, 5e3).replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function validateAndSanitizeChat(data) {
+  const parsed = chatRequestSchema.parse(data);
+  return {
+    ...parsed,
+    messages: parsed.messages.map((msg) => ({
+      ...msg,
+      content: sanitizeMessage(msg.content)
+    }))
+  };
+}
+function validateAndSanitizeInsights(data) {
+  return insightsRequestSchema.parse(data);
+}
+
+// src/lib/services/chatbot.service.ts
 var import_genai = require("@google/genai");
-var ai = new import_genai.GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "AQ.Ab8RN6Ku_Gc8eVpbUHhrSjq2oNKCw69Ok-dzjLJ9KRzcstYtJA" });
+
+// src/lib/services/logger.service.ts
+var LoggerService = class {
+  constructor() {
+    this.isDev = process.env.NODE_ENV !== "production";
+    this.logs = [];
+  }
+  log(entry) {
+    const fullEntry = {
+      ...entry,
+      timestamp: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    this.logs.push(fullEntry);
+    if (this.isDev) {
+      const prefix = `[${fullEntry.service}] ${fullEntry.action}`;
+      switch (fullEntry.level) {
+        case "error":
+          console.error(
+            prefix,
+            fullEntry.error_code ? `(${fullEntry.error_code})` : "",
+            fullEntry.error_message || ""
+          );
+          break;
+        case "warn":
+          console.warn(prefix, fullEntry);
+          break;
+        case "debug":
+          console.debug(prefix, fullEntry);
+          break;
+        default:
+          console.log(prefix, fullEntry);
+      }
+    }
+  }
+  info(service, action, metadata) {
+    this.log({
+      level: "info",
+      service,
+      action,
+      status: "success",
+      ...metadata
+    });
+  }
+  warn(service, action, metadata) {
+    this.log({
+      level: "warn",
+      service,
+      action,
+      status: "failure",
+      ...metadata
+    });
+  }
+  error(service, action, code, message, metadata) {
+    this.log({
+      level: "error",
+      service,
+      action,
+      status: "failure",
+      error_code: code,
+      error_message: message,
+      ...metadata
+    });
+  }
+  debug(service, action, metadata) {
+    this.log({
+      level: "debug",
+      service,
+      action,
+      status: "success",
+      ...metadata
+    });
+  }
+  // Get logs for analysis (in production, send to external logging service)
+  getLogs(filter) {
+    let filtered = [...this.logs];
+    if (filter?.level) {
+      filtered = filtered.filter((l) => l.level === filter.level);
+    }
+    if (filter?.service) {
+      filtered = filtered.filter((l) => l.service === filter.service);
+    }
+    const limit = filter?.limit || 100;
+    return filtered.slice(-limit);
+  }
+  // Get quota usage stats
+  getQuotaStats() {
+    const now = /* @__PURE__ */ new Date();
+    const hourAgo = new Date(now.getTime() - 60 * 60 * 1e3);
+    const dayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1e3);
+    const recentHour = this.logs.filter((l) => new Date(l.timestamp) > hourAgo);
+    const recentDay = this.logs.filter((l) => new Date(l.timestamp) > dayAgo);
+    return {
+      lastHour: {
+        requests: recentHour.length,
+        tokens: recentHour.reduce((sum, l) => sum + (l.tokens_used || 0), 0),
+        errors: recentHour.filter((l) => l.status === "failure").length
+      },
+      lastDay: {
+        requests: recentDay.length,
+        tokens: recentDay.reduce((sum, l) => sum + (l.tokens_used || 0), 0),
+        errors: recentDay.filter((l) => l.status === "failure").length
+      }
+    };
+  }
+};
+var loggerService = new LoggerService();
+
+// src/lib/services/chatbot.service.ts
+var ChatbotService = class {
+  constructor(apiKey) {
+    this.retryConfig = {
+      maxRetries: 3,
+      initialDelayMs: 1e3,
+      maxDelayMs: 16e3,
+      backoffMultiplier: 2
+    };
+    this.tokenEstimate = 0;
+    this.model = "gemini-2.0-flash";
+    const key = apiKey || process.env.GEMINI_API_KEY;
+    if (!key) {
+      throw new Error("GEMINI_API_KEY is required");
+    }
+    this.ai = new import_genai.GoogleGenAI({ apiKey: key });
+  }
+  /**
+   * Generate response with retry logic and error handling
+   */
+  async generateResponse(messages, sessionId) {
+    const startTime = Date.now();
+    try {
+      const estimatedTokens = this.estimateTokens(messages);
+      if (estimatedTokens > 3e4) {
+        throw {
+          code: "TOKEN_LIMIT_EXCEEDED",
+          message: "Request exceeds token limit. Please clear conversation history.",
+          retryable: false
+        };
+      }
+      const systemPrompt = `You are EcoBuddy, a friendly AI assistant helping users reduce their carbon footprint.
+      
+Guidelines:
+- Provide actionable, specific advice tailored to the user's activities
+- Be encouraging and positive about sustainability
+- Give concrete numbers and statistics when relevant
+- Keep responses concise (2-3 paragraphs max)
+- If unsure about carbon impact, provide realistic estimates`;
+      const conversationHistory = messages.slice(-10).map((msg) => ({
+        role: msg.role,
+        parts: [{ text: msg.content }]
+      }));
+      const response = await this.retryWithBackoff(async () => {
+        const result = await this.ai.getGenerativeModel({ model: this.model }).generateContent({
+          systemInstruction: systemPrompt,
+          contents: conversationHistory
+        });
+        return result;
+      });
+      const responseText = this.extractText(response);
+      const tokensUsed = this.estimateTokens([
+        { role: "user", content: messages[messages.length - 1].content },
+        { role: "assistant", content: responseText }
+      ]);
+      loggerService.info("chatbot", "generate_response_success", {
+        duration_ms: Date.now() - startTime,
+        tokens_used: tokensUsed,
+        user_session_id: sessionId
+      });
+      return {
+        response: responseText,
+        tokensUsed
+      };
+    } catch (error) {
+      const duration = Date.now() - startTime;
+      const errorCode = this.getErrorCode(error);
+      const errorMessage = this.getErrorMessage(error);
+      const retryable = this.isRetryableError(errorCode);
+      loggerService.error(
+        "chatbot",
+        "generate_response_failed",
+        errorCode,
+        errorMessage,
+        {
+          duration_ms: duration,
+          user_session_id: sessionId
+        }
+      );
+      throw {
+        code: errorCode,
+        message: this.getUserFriendlyMessage(errorCode, errorMessage),
+        retryable
+      };
+    }
+  }
+  /**
+   * Generate insights with error handling
+   */
+  async generateInsights(activities, totalFootprint, sessionId) {
+    const startTime = Date.now();
+    try {
+      const prompt = `Analyze these carbon footprint activities and provide 3 personalized insights:
+      
+Activities: ${JSON.stringify(activities)}
+Total Footprint: ${totalFootprint} kg CO2e
+
+Provide insights as a JSON object with:
+{
+  "insights": ["insight1", "insight2", "insight3"],
+  "recommendation": "main_recommendation"
+}`;
+      const response = await this.retryWithBackoff(async () => {
+        return await this.ai.getGenerativeModel({ model: this.model }).generateContent(prompt);
+      });
+      const responseText = this.extractText(response);
+      const parsed = this.parseJSON(responseText);
+      loggerService.info("chatbot", "generate_insights_success", {
+        duration_ms: Date.now() - startTime,
+        user_session_id: sessionId
+      });
+      return {
+        insights: parsed.insights || [],
+        recommendation: parsed.recommendation || ""
+      };
+    } catch (error) {
+      const errorCode = this.getErrorCode(error);
+      const errorMessage = this.getErrorMessage(error);
+      loggerService.error(
+        "chatbot",
+        "generate_insights_failed",
+        errorCode,
+        errorMessage,
+        {
+          duration_ms: Date.now() - startTime,
+          user_session_id: sessionId
+        }
+      );
+      throw {
+        code: errorCode,
+        message: this.getUserFriendlyMessage(errorCode, errorMessage),
+        retryable: this.isRetryableError(errorCode)
+      };
+    }
+  }
+  /**
+   * Retry with exponential backoff
+   */
+  async retryWithBackoff(fn) {
+    let lastError;
+    let delay = this.retryConfig.initialDelayMs;
+    for (let attempt = 0; attempt <= this.retryConfig.maxRetries; attempt++) {
+      try {
+        return await fn();
+      } catch (error) {
+        lastError = error;
+        const code = this.getErrorCode(error);
+        if (!this.isRetryableError(code)) {
+          throw error;
+        }
+        if (attempt === this.retryConfig.maxRetries) {
+          break;
+        }
+        const jitter = Math.random() * 0.1 * delay;
+        const waitTime = Math.min(
+          delay + jitter,
+          this.retryConfig.maxDelayMs
+        );
+        await this.sleep(waitTime);
+        delay = Math.min(
+          delay * this.retryConfig.backoffMultiplier,
+          this.retryConfig.maxDelayMs
+        );
+        loggerService.debug("chatbot", `retry_attempt_${attempt + 1}`);
+      }
+    }
+    throw lastError;
+  }
+  /**
+   * Extract text from Gemini response
+   */
+  extractText(response) {
+    try {
+      if (response.text) return response.text;
+      if (response.candidates?.[0]?.content?.parts?.[0]?.text) {
+        return response.candidates[0].content.parts[0].text;
+      }
+      throw new Error("Invalid response structure");
+    } catch {
+      throw {
+        code: "RESPONSE_PARSE_ERROR",
+        message: "Failed to parse API response",
+        retryable: false
+      };
+    }
+  }
+  /**
+   * Parse JSON from text safely
+   */
+  parseJSON(text) {
+    try {
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        return { insights: [], recommendation: text };
+      }
+      return JSON.parse(jsonMatch[0]);
+    } catch {
+      return { insights: [], recommendation: text };
+    }
+  }
+  /**
+   * Estimate tokens (rough calculation)
+   */
+  estimateTokens(messages) {
+    const totalChars = messages.reduce((sum, msg) => sum + msg.content.length, 0);
+    return Math.ceil(totalChars / 4);
+  }
+  /**
+   * Determine error code
+   */
+  getErrorCode(error) {
+    if (typeof error === "object" && error?.code) {
+      return error.code;
+    }
+    if (error?.status === 429) return "RATE_LIMITED";
+    if (error?.status === 503) return "SERVICE_UNAVAILABLE";
+    if (error?.status === 401) return "UNAUTHORIZED";
+    if (error?.message?.includes("timeout")) return "TIMEOUT";
+    return "API_ERROR";
+  }
+  /**
+   * Get error message
+   */
+  getErrorMessage(error) {
+    return error?.message || String(error);
+  }
+  /**
+   * Check if error is retryable
+   */
+  isRetryableError(code) {
+    return ["RATE_LIMITED", "SERVICE_UNAVAILABLE", "TIMEOUT", "API_ERROR"].includes(code);
+  }
+  /**
+   * Get user-friendly error message
+   */
+  getUserFriendlyMessage(code, _fallback) {
+    const messages = {
+      RATE_LIMITED: "The AI is busy right now. Please try again in a moment.",
+      SERVICE_UNAVAILABLE: "The AI service is temporarily unavailable. Please try again soon.",
+      UNAUTHORIZED: "There's an authentication issue. Please refresh and try again.",
+      TIMEOUT: "The request took too long. Please try again with a shorter message.",
+      TOKEN_LIMIT_EXCEEDED: "Your conversation is too long. Please start a new chat.",
+      RESPONSE_PARSE_ERROR: "There was an issue processing the response. Please try again.",
+      API_ERROR: "Something went wrong with the AI service. Please try again."
+    };
+    return messages[code] || messages.API_ERROR;
+  }
+  /**
+   * Sleep helper
+   */
+  sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+};
+var chatbotService = new ChatbotService();
+
+// server.ts
+var API_KEY = process.env.GEMINI_API_KEY;
+if (!API_KEY) {
+  console.error("ERROR: GEMINI_API_KEY environment variable is not set");
+  process.exit(1);
+}
+var limiter = (0, import_express_rate_limit.default)({
+  windowMs: 15 * 60 * 1e3,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false
+});
+var chatLimiter = (0, import_express_rate_limit.default)({
+  windowMs: 60 * 1e3,
+  max: 30,
+  skipSuccessfulRequests: false
+});
+var corsOptions = {
+  origin: process.env.ALLOWED_ORIGINS?.split(",") || ["http://localhost:3000", "http://localhost:5173"],
+  credentials: true,
+  optionsSuccessStatus: 200
+};
 async function startServer() {
   const app = (0, import_express.default)();
   const PORT = 3e3;
-  app.use(import_express.default.json({ limit: "50mb" }));
-  app.post("/api/insights", async (req, res) => {
-    try {
-      const { activities, totalFootprint } = req.body;
-      const prompt = `You are a carbon footprint reduction expert. The user has a total footprint of ${totalFootprint} kg CO2e.
-      Here are their recent activities: ${JSON.stringify(activities.slice(0, 5))}.
-      Provide 3 personalized insights or actionable tips to help them reduce their footprint.`;
-      let response;
-      let maxRetries = 2;
-      for (let i = 0; i < maxRetries; i++) {
-        try {
-          response = await ai.models.generateContent({
-            model: "gemini-3.5-flash",
-            contents: prompt,
-            config: {
-              responseMimeType: "application/json",
-              responseSchema: {
-                type: import_genai.Type.ARRAY,
-                items: {
-                  type: import_genai.Type.OBJECT,
-                  properties: {
-                    category: { type: import_genai.Type.STRING, description: "One of: 'transport', 'diet', 'energy', or 'shopping'" },
-                    tip: { type: import_genai.Type.STRING, description: "A concise, actionable instruction" },
-                    potentialSavingsKg: { type: import_genai.Type.NUMBER, description: "Estimated kg of CO2e saved per month if followed" }
-                  },
-                  required: ["category", "tip", "potentialSavingsKg"]
-                }
-              }
-            }
-          });
-          break;
-        } catch (e) {
-          if (i === maxRetries - 1) throw e;
-          if (e.status === "UNAVAILABLE" || e.status === 503 || e.message && e.message.includes("high demand")) {
-            await new Promise((res2) => setTimeout(res2, 2e3 * (i + 1)));
-          } else {
-            throw e;
-          }
-        }
-      }
-      let rawText = "[]";
-      if (response && response.candidates && response.candidates.length > 0) {
-        const parts = response.candidates[0].content?.parts || [];
-        const textParts = parts.filter((p) => p.text);
-        if (textParts.length > 0) {
-          rawText = textParts.map((p) => p.text).join("");
-        }
-      }
-      const insights = JSON.parse(rawText);
-      res.json({ insights });
-    } catch (error) {
-      console.error("AI Insights Error:", error);
-      if (error?.status === "RESOURCE_EXHAUSTED" || error?.status === 429) {
-        res.status(429).json({ error: "API quota exceeded. Please wait a minute and try again." });
-      } else if (error?.status === "UNAVAILABLE" || error?.status === 503 || error?.message && error?.message.includes("high demand")) {
-        res.status(503).json({ error: "The AI model is currently experiencing high demand. Please try again in a few moments." });
-      } else {
-        res.status(500).json({ error: "Failed to generate insights." });
-      }
-    }
-  });
-  const logActivityTool = {
-    name: "logActivity",
-    description: "Logs a user's carbon-impacting activity to the dashboard when they explicitly mention doing it today or recently (e.g. eating food, driving, buying something, using power). Never ask for permission to log, just log it and confirm.",
-    parameters: {
-      type: import_genai.Type.OBJECT,
-      properties: {
-        type: {
-          type: import_genai.Type.STRING,
-          description: "Strictly one of: 'transport', 'diet', 'energy', 'shopping', 'water'."
-        },
-        title: {
-          type: import_genai.Type.STRING,
-          description: "Concise title of the activity, e.g. 'Drove 20 miles' or 'Ate a cheeseburger'"
-        },
-        co2ImpactKg: {
-          type: import_genai.Type.NUMBER,
-          description: "The estimated CO2 footprint of this activity in kg. Examples: Car=0.4kg/mile, Flight=0.25kg/mile, Meat meal=2.5kg, Electricity=0.4kg/kWh, Water=0.001kg/gallon."
+  app.use(
+    (0, import_helmet.default)({
+      contentSecurityPolicy: {
+        directives: {
+          defaultSrc: ["'self'"],
+          scriptSrc: ["'self'", "'unsafe-inline'"],
+          styleSrc: ["'self'", "'unsafe-inline'"],
+          imgSrc: ["'self'", "data:", "https:"],
+          connectSrc: ["'self'", "https://generativelanguage.googleapis.com"]
         }
       },
-      required: ["type", "title", "co2ImpactKg"]
-    }
-  };
-  app.post("/api/chat", async (req, res) => {
+      frameguard: { action: "deny" },
+      referrerPolicy: { policy: "strict-origin-when-cross-origin" }
+    })
+  );
+  app.use((0, import_cors.default)(corsOptions));
+  app.use(import_express.default.json({ limit: "10mb" }));
+  app.use(import_express.default.urlencoded({ limit: "10mb", extended: true }));
+  app.use(limiter);
+  app.get("/api/health", (req, res) => {
+    res.json({ status: "ok", timestamp: (/* @__PURE__ */ new Date()).toISOString() });
+  });
+  app.post("/api/chat", chatLimiter, async (req, res) => {
     try {
-      const { messages } = req.body;
-      const history = messages.slice(0, -1).map((m) => {
-        const parts = [];
-        if (m.content) parts.push({ text: m.content });
-        if (m.attachment) parts.push({ inlineData: { mimeType: m.attachment.mimeType, data: m.attachment.data } });
-        return {
-          role: m.role === "user" ? "user" : "model",
-          parts: parts.length > 0 ? parts : [{ text: "" }]
-        };
+      const validated = validateAndSanitizeChat(req.body);
+      const sessionId = validated.sessionId || `session-${Date.now()}`;
+      loggerService.info("chat", "request_received", {
+        user_session_id: sessionId,
+        message_count: validated.messages.length
       });
-      const latestMessage = messages[messages.length - 1];
-      const messageParts = [];
-      if (latestMessage.content) messageParts.push({ text: latestMessage.content });
-      if (latestMessage.attachment) messageParts.push({ inlineData: { mimeType: latestMessage.attachment.mimeType, data: latestMessage.attachment.data } });
-      const chat = ai.chats.create({
-        model: "gemini-3.5-flash",
-        config: {
-          systemInstruction: `You are EcoBuddy, an extremely cute, friendly, and enthusiastic AI character. You act like the user's best eco-friend! Greet them warmly with emojis.
-          Ask them conversational questions about their day ("What did you eat today?", "Where did you go?").
-          If they upload an image, analyze it to estimate the carbon footprint.
-          When they tell you an activity, analyze its environmental impact gently and describe it simply to them. Keep responses concise and fast to improve responsiveness!
-          Weave optimistic reduction suggestions naturally into the conversation without being too long.
-          
-          CRITICAL: If the user describes a carbon-impacting activity (e.g., "I ate pizza", "I took a bus to work"), YOU MUST CALL the \`logActivity\` tool to automatically log it to their dashboard. ALWAYS run the tool call AND return a conversational text reply in the SAME response so the user gets immediate feedback.`,
-          tools: [{ functionDeclarations: [logActivityTool] }]
-        },
-        history
+      const result = await chatbotService.generateResponse(validated.messages, sessionId);
+      loggerService.info("chat", "response_sent", {
+        user_session_id: sessionId,
+        tokens_used: result.tokensUsed
       });
-      let maxRetries = 2;
-      let response;
-      for (let i = 0; i < maxRetries; i++) {
-        try {
-          response = await chat.sendMessage({ message: messageParts });
-          break;
-        } catch (e) {
-          if (i === maxRetries - 1) throw e;
-          if (e.status === "UNAVAILABLE" || e.status === 503 || e.message && e.message.includes("high demand")) {
-            await new Promise((res2) => setTimeout(res2, 2e3 * (i + 1)));
-          } else {
-            throw e;
-          }
-        }
-      }
-      let replyText = "";
-      if (response && response.candidates && response.candidates.length > 0) {
-        const parts = response.candidates[0].content?.parts || [];
-        const textParts = parts.filter((p) => p.text);
-        if (textParts.length > 0) {
-          replyText = textParts.map((p) => p.text).join("");
-        }
-      }
-      let autoLoggedActivity = null;
-      if (response?.functionCalls && response.functionCalls.length > 0) {
-        const call = response.functionCalls[0];
-        if (call.name === "logActivity" && call.args) {
-          autoLoggedActivity = call.args;
-          if (!replyText) {
-            let funcResponse;
-            for (let i = 0; i < maxRetries; i++) {
-              try {
-                funcResponse = await chat.sendMessage({
-                  message: [{
-                    functionResponse: {
-                      name: call.name,
-                      response: { status: "success", message: "Activity successfully logged to dashboard. You can now reply to the user." }
-                    }
-                  }]
-                });
-                break;
-              } catch (e) {
-                if (i === maxRetries - 1) throw e;
-                if (e.status === "UNAVAILABLE" || e.status === 503 || e.message && e.message.includes("high demand")) {
-                  await new Promise((res2) => setTimeout(res2, 2e3 * (i + 1)));
-                } else {
-                  throw e;
-                }
-              }
-            }
-            if (!replyText && funcResponse && funcResponse.candidates && funcResponse.candidates.length > 0) {
-              const parts = funcResponse.candidates[0].content?.parts || [];
-              const textParts = parts.filter((p) => p.text);
-              if (textParts.length > 0) {
-                replyText = textParts.map((p) => p.text).join("");
-              }
-            }
-          }
-        }
-      }
-      res.json({ reply: replyText, autoLoggedActivity });
+      res.json({
+        success: true,
+        reply: result.response,
+        tokensUsed: result.tokensUsed
+      });
     } catch (error) {
-      console.error("AI Chat Error:", error);
-      if (error?.status === "RESOURCE_EXHAUSTED" || error?.status === 429) {
-        res.status(429).json({ error: "API quota exceeded. Please wait a minute and try again." });
-      } else if (error?.status === "UNAVAILABLE" || error?.status === 503 || error?.message && error.message.includes("high demand")) {
-        res.status(503).json({ error: "The AI model is currently experiencing high demand. Please try again in a few moments." });
-      } else {
-        res.status(500).json({ error: "Failed to generate chat response." });
-      }
+      const code = error?.code || "UNKNOWN_ERROR";
+      const message = error?.message || "An unexpected error occurred";
+      const retryable = error?.retryable || false;
+      loggerService.error("chat", "request_failed", code, message);
+      const statusCode = code === "RATE_LIMITED" ? 429 : code === "SERVICE_UNAVAILABLE" ? 503 : 500;
+      res.status(statusCode).json({
+        success: false,
+        error: {
+          code,
+          message,
+          retryable
+        }
+      });
     }
+  });
+  app.post("/api/insights", limiter, async (req, res) => {
+    try {
+      const validated = validateAndSanitizeInsights(req.body);
+      const sessionId = `session-${Date.now()}`;
+      loggerService.info("insights", "request_received", {
+        user_session_id: sessionId,
+        activity_count: validated.activities.length
+      });
+      const result = await chatbotService.generateInsights(
+        validated.activities,
+        validated.totalFootprint,
+        sessionId
+      );
+      loggerService.info("insights", "response_sent", {
+        user_session_id: sessionId
+      });
+      res.json({
+        success: true,
+        insights: result.insights,
+        recommendation: result.recommendation
+      });
+    } catch (error) {
+      const code = error?.code || "UNKNOWN_ERROR";
+      const message = error?.message || "An unexpected error occurred";
+      const retryable = error?.retryable || false;
+      loggerService.error("insights", "request_failed", code, message);
+      const statusCode = code === "RATE_LIMITED" ? 429 : code === "SERVICE_UNAVAILABLE" ? 503 : 500;
+      res.status(statusCode).json({
+        success: false,
+        error: {
+          code,
+          message,
+          retryable
+        }
+      });
+    }
+  });
+  app.get("/api/logs", (req, res) => {
+    if (process.env.NODE_ENV === "production") {
+      return res.status(403).json({ error: "Not available in production" });
+    }
+    const limit = parseInt(req.query.limit, 10) || 50;
+    const logs = loggerService.getLogs({ limit });
+    const stats = loggerService.getQuotaStats();
+    res.json({ logs, stats });
   });
   if (process.env.NODE_ENV !== "production") {
     const vite = await (0, import_vite.createServer)({
@@ -224,13 +590,17 @@ async function startServer() {
   } else {
     const distPath = import_path.default.join(process.cwd(), "dist");
     app.use(import_express.default.static(distPath));
-    app.get("*all", (req, res) => {
+    app.get("*", (req, res) => {
       res.sendFile(import_path.default.join(distPath, "index.html"));
     });
   }
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
+    loggerService.info("server", "started", { port: PORT });
   });
 }
-startServer();
+startServer().catch((error) => {
+  console.error("Failed to start server:", error);
+  process.exit(1);
+});
 //# sourceMappingURL=server.cjs.map
