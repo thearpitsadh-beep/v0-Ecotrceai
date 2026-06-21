@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { Dashboard } from './components/Dashboard';
+import { useState, useEffect, useMemo, useCallback } from 'react';
+import { MemoizedDashboard } from './components/MemoizedDashboard';
 import { ActivityLog } from './components/ActivityLog';
 import { AIAgent } from './components/AIAgent';
 import { Challenges } from './components/Challenges';
@@ -77,9 +77,18 @@ export default function App() {
     }
   }, [lastLogDate]);
 
-  const totalFootprint = activities.reduce((sum, act) => sum + act.co2ImpactKg, 0);
+  // Memoize expensive calculations
+  const totalFootprint = useMemo(
+    () => activities.reduce((sum, act) => sum + act.co2ImpactKg, 0),
+    [activities]
+  );
 
-  const handleAddActivity = (newActivity: Omit<CarbonActivity, 'id' | 'date'>) => {
+  const energyGrade = useMemo(() => totalFootprint < 50 ? 'A+' : 'B-', [totalFootprint]);
+  const treesOffset = useMemo(() => Math.floor(12 + (activities.length * 0.5)), [activities.length]);
+  const remainingGoal = useMemo(() => totalFootprint > 150 ? 0 : 150 - totalFootprint, [totalFootprint]);
+
+  // Memoize callbacks to prevent unnecessary re-renders of child components
+  const handleAddActivity = useCallback((newActivity: Omit<CarbonActivity, 'id' | 'date'>) => {
     const today = new Date().toISOString().split('T')[0];
     if (lastLogDate === null) {
       setStreak(1);
@@ -111,17 +120,17 @@ export default function App() {
     if (isMobileChatOpen) {
       setIsMobileChatOpen(false);
     }
-  };
+  }, [isMobileChatOpen]);
 
-  const handleImportData = (importedActivities: CarbonActivity[], points: number) => {
+  const handleImportData = useCallback((importedActivities: CarbonActivity[], points: number) => {
     setActivities(importedActivities);
     setGreenPoints(points);
     setActiveTab('dashboard');
-  };
+  }, []);
 
-  const handleAwardPoints = (points: number) => {
+  const handleAwardPoints = useCallback((points: number) => {
     setGreenPoints(prev => prev + points);
-  };
+  }, []);
 
   return (
     <div className="flex flex-col min-h-screen bg-[#F8FAFC] selection:bg-emerald-200 pb-20 md:pb-0 relative">
@@ -229,9 +238,9 @@ export default function App() {
                     </div>
                   </div>
                   <div className="mt-6 pt-4 border-t border-slate-100 space-y-3">
-                     <p className="text-sm text-slate-600 flex items-center gap-2">
+                      <p className="text-sm text-slate-600 flex items-center gap-2">
                         <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
-                        Save <strong>150 kg of CO2</strong> this year goal: {(totalFootprint > 150 ? 0 : 150 - totalFootprint).toFixed(0)}kg left
+                        Save <strong>150 kg of CO2</strong> this year goal: {remainingGoal.toFixed(0)}kg left
                      </p>
                      <p className="text-sm text-slate-600 flex items-center gap-2">
                         <span className="w-2 h-2 rounded-full bg-blue-400"></span>
@@ -248,7 +257,7 @@ export default function App() {
                       </div>
                       <p className="text-xs text-slate-500 font-medium uppercase tracking-wider">Energy Grade</p>
                     </div>
-                    <p className="text-2xl font-bold text-slate-800">{totalFootprint < 50 ? 'A+' : 'B-'}</p>
+                    <p className="text-2xl font-bold text-slate-800">{energyGrade}</p>
                   </div>
                   <div className="bg-white p-5 rounded-2xl border border-slate-100 shadow-sm flex flex-col justify-between">
                     <div className="mb-4">
@@ -257,12 +266,12 @@ export default function App() {
                       </div>
                       <p className="text-xs text-slate-500 font-medium uppercase tracking-wider">Air Offset</p>
                     </div>
-                    <p className="text-2xl font-bold text-slate-800">{Math.floor(12 + (activities.length * 0.5))} Trees</p>
+                    <p className="text-2xl font-bold text-slate-800">{treesOffset} Trees</p>
                   </div>
                 </div>
 
                 <div className="flex-1">
-                   <Dashboard activities={activities} totalFootprint={totalFootprint} streak={streak} greenPoints={greenPoints} hideTopCard />
+                   <MemoizedDashboard activities={activities} totalFootprint={totalFootprint} streak={streak} greenPoints={greenPoints} hideTopCard />
                 </div>
              </div>
 
