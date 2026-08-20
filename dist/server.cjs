@@ -210,10 +210,20 @@ var ChatbotService = class {
     this.tokenEstimate = 0;
     this.model = "gemini-2.0-flash";
     const key = apiKey || process.env.GEMINI_API_KEY;
-    if (!key) {
-      throw new Error("GEMINI_API_KEY is required");
+    this.configured = Boolean(key);
+    if (key) {
+      this.ai = new import_genai.GoogleGenAI({ apiKey: key });
     }
-    this.ai = new import_genai.GoogleGenAI({ apiKey: key });
+  }
+  requireAI() {
+    if (!this.configured || !this.ai) {
+      throw {
+        code: "SERVICE_UNAVAILABLE",
+        message: "AI features are not configured. Set GEMINI_API_KEY to enable EcoBuddy.",
+        retryable: false
+      };
+    }
+    return this.ai;
   }
   /**
    * Generate response with retry logic and error handling
@@ -241,8 +251,9 @@ Guidelines:
         role: msg.role,
         parts: [{ text: msg.content }]
       }));
+      const ai = this.requireAI();
       const response = await this.retryWithBackoff(async () => {
-        const result = await this.ai.getGenerativeModel({ model: this.model }).generateContent({
+        const result = await ai.getGenerativeModel({ model: this.model }).generateContent({
           systemInstruction: systemPrompt,
           contents: conversationHistory
         });
@@ -300,8 +311,9 @@ Provide insights as a JSON object with:
   "insights": ["insight1", "insight2", "insight3"],
   "recommendation": "main_recommendation"
 }`;
+      const ai = this.requireAI();
       const response = await this.retryWithBackoff(async () => {
-        return await this.ai.getGenerativeModel({ model: this.model }).generateContent(prompt);
+        return await ai.getGenerativeModel({ model: this.model }).generateContent(prompt);
       });
       const responseText = this.extractText(response);
       const parsed = this.parseJSON(responseText);

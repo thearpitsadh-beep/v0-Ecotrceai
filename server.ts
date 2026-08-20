@@ -14,12 +14,8 @@ import {
 import { chatbotService } from './src/lib/services/chatbot.service';
 import { loggerService } from './src/lib/services/logger.service';
 
-// Validate API key at startup
-const API_KEY = process.env.GEMINI_API_KEY;
-if (!API_KEY) {
-  console.error('ERROR: GEMINI_API_KEY environment variable is not set');
-  process.exit(1);
-}
+// AI credentials are checked per request so the preview can load without
+// configured Gemini credentials; chatbotService returns a controlled error.
 
 // Rate limiting
 const limiter = rateLimit({

@@ -3,7 +3,8 @@ import { ChatMessage, RetryConfig, GeminiResponse } from '../types/api.types';
 import { loggerService } from './logger.service';
 
 class ChatbotService {
-  private ai: GoogleGenAI;
+  private ai?: GoogleGenAI;
+  private readonly configured: boolean;
   private retryConfig: RetryConfig = {
     maxRetries: 3,
     initialDelayMs: 1000,
@@ -16,10 +17,25 @@ class ChatbotService {
 
   constructor(apiKey?: string) {
     const key = apiKey || process.env.GEMINI_API_KEY;
-    if (!key) {
-      throw new Error('GEMINI_API_KEY is required');
+    this.configured = Boolean(key);
+
+    // Keep the preview available when AI credentials are not configured.
+    // Requests will return a controlled configuration error instead of
+    // crashing the entire server during module initialization.
+    if (key) {
+      this.ai = new GoogleGenAI({ apiKey: key });
     }
-    this.ai = new GoogleGenAI({ apiKey: key });
+  }
+
+  private requireAI(): GoogleGenAI {
+    if (!this.configured || !this.ai) {
+      throw {
+        code: 'SERVICE_UNAVAILABLE',
+        message: 'AI features are not configured. Set GEMINI_API_KEY to enable EcoBuddy.',
+        retryable: false,
+      };
+    }
+    return this.ai;
   }
 
   /**
@@ -60,8 +76,9 @@ Guidelines:
           parts: [{ text: msg.content }],
         }));
 
+      const ai = this.requireAI();
       const response = await this.retryWithBackoff(async () => {
-        const result = await this.ai
+        const result = await ai
           .getGenerativeModel({ model: this.model })
           .generateContent({
             systemInstruction: systemPrompt,
@@ -134,8 +151,9 @@ Provide insights as a JSON object with:
   "recommendation": "main_recommendation"
 }`;
 
+      const ai = this.requireAI();
       const response = await this.retryWithBackoff(async () => {
-        return await this.ai
+        return await ai
           .getGenerativeModel({ model: this.model })
           .generateContent(prompt);
       });
